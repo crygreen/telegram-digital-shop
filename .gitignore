@@ -1,0 +1,6 @@
+venv/
+.env
+shop_bot.db
+__pycache__/
+*.log
+.DS_Store
