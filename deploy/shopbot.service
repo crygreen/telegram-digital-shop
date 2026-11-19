@@ -1,0 +1,25 @@
+[Unit]
+Description=ShopBot Telegram demo
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+User=shopbot
+Group=shopbot
+WorkingDirectory=/opt/shopbot
+EnvironmentFile=/opt/shopbot/.env
+Environment=DB_PATH=/var/lib/shopbot/shop_bot.db
+ExecStart=/opt/shopbot/.venv/bin/python /opt/shopbot/main.py
+StateDirectory=shopbot
+StateDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

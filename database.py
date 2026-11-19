@@ -1,9 +1,13 @@
 import sqlite3
 import os
+from contextlib import closing
+from pathlib import Path
+from uuid import uuid4
 
-DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'shop_bot.db')
+DB_PATH = os.getenv('DB_PATH') or str(Path(__file__).with_name('shop_bot.db'))
 
 def init_db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     
@@ -40,6 +44,8 @@ def init_db():
         cursor.execute('ALTER TABLE products ADD COLUMN price_rub INTEGER')
     if 'price_stars' not in product_columns:
         cursor.execute('ALTER TABLE products ADD COLUMN price_stars INTEGER')
+    if 'delivery_kind' not in product_columns:
+        cursor.execute("ALTER TABLE products ADD COLUMN delivery_kind TEXT NOT NULL DEFAULT 'photo'")
     cursor.execute('UPDATE products SET price_rub = price WHERE price_rub IS NULL')
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS settings (
@@ -73,6 +79,25 @@ def init_db():
         ON card_orders (user_id, product_id)
         WHERE status IN ('awaiting_receipt', 'submitted', 'delivering', 'delivery_failed')
     ''')
+    card_columns = [row[1] for row in cursor.execute('PRAGMA table_info(card_orders)')]
+    if 'delivery_kind' not in card_columns:
+        cursor.execute("ALTER TABLE card_orders ADD COLUMN delivery_kind TEXT NOT NULL DEFAULT 'photo'")
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS star_orders (
+            id TEXT PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            product_id INTEGER NOT NULL,
+            product_name TEXT NOT NULL,
+            amount INTEGER NOT NULL CHECK (amount > 0),
+            file_id TEXT NOT NULL,
+            delivery_kind TEXT NOT NULL,
+            mode TEXT NOT NULL,
+            checkout_id TEXT,
+            charge_id TEXT UNIQUE,
+            status TEXT NOT NULL DEFAULT 'created',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
     conn.commit()
     conn.close()
 
@@ -98,12 +123,13 @@ def get_language(user_id):
     conn.close()
     return result[0] if result else 'ru'
 
-def add_product(name, price_rub, price_stars, photo_id, full_photo_id):
+def add_product(name, price_rub, price_stars, photo_id, full_photo_id, delivery_kind='photo'):
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
     cursor.execute(
-        'INSERT INTO products (name, price, price_rub, price_stars, photo_id, full_photo_id) VALUES (?, ?, ?, ?, ?, ?)',
-        (name, price_rub, price_rub, price_stars, photo_id, full_photo_id)
+        '''INSERT INTO products (name, price, price_rub, price_stars, photo_id, full_photo_id, delivery_kind)
+           VALUES (?, ?, ?, ?, ?, ?, ?)''',
+        (name, price_rub, price_rub, price_stars, photo_id, full_photo_id, delivery_kind)
     )
     conn.commit()
     conn.close()
@@ -156,6 +182,12 @@ def get_product(product_id):
     conn.close()
     return product
 
+
+def get_delivery_kind(product_id):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        row = conn.execute('SELECT delivery_kind FROM products WHERE id = ?', (product_id,)).fetchone()
+    return row[0] if row else 'photo'
+
 def get_status():
     conn = sqlite3.connect(DB_PATH)
     cursor = conn.cursor()
@@ -191,13 +223,14 @@ def create_card_order(user_id, product):
     if not isinstance(price_rub, int) or price_rub <= 0 or not full_photo_id:
         raise ValueError('Product needs a positive price and a delivery file')
     conn = sqlite3.connect(DB_PATH)
+    delivery_kind = get_delivery_kind(product_id)
     try:
         with conn:
             conn.execute('''
                 INSERT OR IGNORE INTO card_orders
-                (user_id, product_id, product_name, price_rub, full_photo_id)
-                VALUES (?, ?, ?, ?, ?)
-            ''', (user_id, product_id, name, price_rub, full_photo_id))
+                (user_id, product_id, product_name, price_rub, full_photo_id, delivery_kind)
+                VALUES (?, ?, ?, ?, ?, ?)
+            ''', (user_id, product_id, name, price_rub, full_photo_id, delivery_kind))
             row = conn.execute('''
                 SELECT id FROM card_orders WHERE user_id = ? AND product_id = ?
                 AND status IN ('awaiting_receipt', 'submitted', 'delivering', 'delivery_failed')
@@ -253,4 +286,46 @@ def get_pending_card_orders():
     finally:
         conn.close()
 
-init_db()
+def create_star_order(user_id, product, mode):
+    product_id, name, _, amount, _, file_id = product
+    order_id = uuid4().hex
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        conn.execute('''
+            INSERT INTO star_orders (id, user_id, product_id, product_name, amount, file_id, delivery_kind, mode)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (order_id, user_id, product_id, name, amount, file_id, get_delivery_kind(product_id), mode))
+    return order_id
+
+
+def authorize_star_checkout(order_id, user_id, amount, checkout_id):
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        result = conn.execute('''
+            UPDATE star_orders SET status = 'checkout', checkout_id = ?
+            WHERE id = ? AND user_id = ? AND amount = ? AND mode = 'telegram_test'
+            AND (status = 'created' OR (status = 'checkout' AND checkout_id = ?))
+        ''', (checkout_id, order_id, user_id, amount, checkout_id))
+        return result.rowcount == 1
+
+
+def record_star_payment(order_id, user_id, amount, charge_id, mode):
+    expected = 'created' if mode == 'demo' else 'checkout'
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        result = conn.execute('''
+            UPDATE OR IGNORE star_orders SET charge_id = ?, status = 'paid'
+            WHERE id = ? AND user_id = ? AND amount = ? AND mode = ? AND status = ? AND charge_id IS NULL
+        ''', (charge_id, order_id, user_id, amount, mode, expected))
+        return result.rowcount == 1
+
+
+def get_star_order(order_id):
+    with closing(sqlite3.connect(DB_PATH)) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute('SELECT * FROM star_orders WHERE id = ?', (order_id,)).fetchone()
+
+
+def change_star_order_status(order_id, expected, status):
+    with closing(sqlite3.connect(DB_PATH)) as conn, conn:
+        result = conn.execute('''
+            UPDATE star_orders SET status = ? WHERE id = ? AND status = ? AND charge_id IS NOT NULL
+        ''', (status, order_id, expected))
+        return result.rowcount == 1

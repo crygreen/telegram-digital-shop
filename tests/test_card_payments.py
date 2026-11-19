@@ -13,7 +13,7 @@ from unittest.mock import AsyncMock, patch
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def load_modules():
+def load_modules(stars_mode='demo'):
     # Load definitions without opening the real shop database or reading .env.
     tree = ast.parse((ROOT / 'database.py').read_text(encoding='utf-8'))
     tree.body = [node for node in tree.body if not (
@@ -26,7 +26,7 @@ def load_modules():
     main = types.ModuleType('shopbot_test')
     main.__file__ = str(ROOT / 'main.py')
     with patch.dict('sys.modules', {'database': database}), patch('dotenv.load_dotenv'), patch.dict(
-        os.environ, {'BOT_TOKEN': '123456:' + 'A' * 35, 'ADMIN_ID': '99', 'CARD_PAYMENT_DETAILS': 'DEMO'}
+        os.environ, {'BOT_TOKEN': '123456:' + 'A' * 35, 'ADMIN_ID': '99', 'STARS_MODE': stars_mode}
     ):
         exec(compile((ROOT / 'main.py').read_text(encoding='utf-8'), main.__file__, 'exec'), main.__dict__)
     return database, main

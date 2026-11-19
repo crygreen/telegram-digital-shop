@@ -2,21 +2,43 @@ import asyncio
 import logging
 import os
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
+from aiogram.filters import Command, CommandObject
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import StatesGroup, State
 from dotenv import load_dotenv
 import database as db
+from price_list import format_price_section, load_price_list
+from stars import send_delivery, star_order_id
 
 load_dotenv()
 BOT_TOKEN = os.getenv('BOT_TOKEN')
-ADMIN_ID = int(os.getenv('ADMIN_ID'))
-CARD_PAYMENT_DETAILS = os.getenv('CARD_PAYMENT_DETAILS', 'ДЕМО: реквизиты не настроены')
+try:
+    ADMIN_ID = int(os.getenv('ADMIN_ID', ''))
+    if ADMIN_ID <= 0:
+        raise ValueError
+except ValueError:
+    raise SystemExit('Set ADMIN_ID to a positive Telegram user ID in .env.')
+if not BOT_TOKEN or BOT_TOKEN == 'your_token_here':
+    raise SystemExit('Set BOT_TOKEN to the token of your demo bot in .env.')
+STARS_MODE = os.getenv('STARS_MODE', 'demo')
+if STARS_MODE not in ('demo', 'telegram_test'):
+    raise ValueError('STARS_MODE must be demo or telegram_test')
 
 logging.basicConfig(level=logging.INFO)
-bot = Bot(token=BOT_TOKEN)
+session = None
+if STARS_MODE == 'telegram_test':
+    session = AiohttpSession(api=TelegramAPIServer(
+        base='https://api.telegram.org/bot{token}/test/{method}',
+        file='https://api.telegram.org/file/bot{token}/test/{path}',
+    ))
+bot = Bot(token=BOT_TOKEN, session=session)
 dp = Dispatcher()
+dp.message.filter(F.chat.type == "private")
+dp.callback_query.filter(F.message.chat.type == "private")
+PRICE_LIST = None
 
 class AdminStates(StatesGroup):
     waiting_for_name = State()
@@ -33,8 +55,9 @@ class CardPaymentStates(StatesGroup):
 
 TEXTS = {
     'ru': {
-        'start': "Добро пожаловать. Полная конфиденциальность.",
+        'start': "Демонстрационный магазин. Реальные платежи здесь не принимаются.",
         'menu_catalog': "📸 Каталог",
+        'menu_price': "📋 Прайс",
         'menu_vip': "💬 Живое общение (VIP)",
         'menu_ask': "❓ Задать вопрос",
         'menu_lang': "🌐 Изменить язык",
@@ -55,7 +78,7 @@ TEXTS = {
         'admin_enter_price': "Введите цену в рублях (только цифры):",
         'admin_enter_price_stars': "Введите цену в Stars (только цифры):",
         'admin_enter_preview': "Отправьте фото-превью (для каталога):",
-        'admin_enter_full': "Отправьте ЭКСКЛЮЗИВНОЕ фото (его увидят только после оплаты):",
+        'admin_enter_full': "Отправьте фото, видео, кружочек или документ для выдачи после оплаты.",
         'admin_success': "Товар успешно добавлен!",
         'wait_confirm': "Ожидайте подтверждения оплаты...",
         'vip_auto_reply': "Сообщение доставлено автору. Как только он выйдет в сеть, он ответит.",
@@ -72,7 +95,7 @@ def get_lang_keyboard():
 
 def get_main_menu():
     return ReplyKeyboardMarkup(keyboard=[
-        [KeyboardButton(text=TEXTS['ru']['menu_catalog'])],
+        [KeyboardButton(text=TEXTS['ru']['menu_catalog']), KeyboardButton(text=TEXTS['ru']['menu_price'])],
         [KeyboardButton(text=TEXTS['ru']['menu_vip'])],
         [KeyboardButton(text=TEXTS['ru']['menu_ask'])], 
         [KeyboardButton(text=TEXTS['ru']['menu_lang'])]
@@ -87,11 +110,13 @@ def get_admin_keyboard():
         [InlineKeyboardButton(text="❌ Отмена", callback_data="admin_cancel")]
     ])
 
-def get_product_creation_keyboard(templates):
+def get_product_creation_keyboard(templates, show_choices=True):
     buttons = [
         [InlineKeyboardButton(text="✍️ Свой товар", callback_data="product_custom")],
         [InlineKeyboardButton(text="📚 Выбрать шаблон", callback_data="product_choose_template")]
     ]
+    if not show_choices:
+        buttons = []
     for template_id, name, price_rub, price_stars in templates:
         buttons.append([
             InlineKeyboardButton(
@@ -99,9 +124,90 @@ def get_product_creation_keyboard(templates):
                 callback_data=f"product_template:{template_id}"
             )
         ])
+    if not show_choices:
+        buttons.append([InlineKeyboardButton(text="Назад", callback_data="admin_add")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-# --- ГЛОБАЛЬНЫЙ СБРОС СОСТОЯНИЯ ---
+async def complete_star_delivery(order_id, expected="paid"):
+    if not db.change_star_order_status(order_id, expected, "delivering"):
+        return False
+    order = db.get_star_order(order_id)
+    try:
+        await send_delivery(
+            bot, order["user_id"], order["delivery_kind"], order["file_id"],
+            f"Заказ {order_id}. Спасибо за покупку!"
+        )
+    except Exception:
+        db.change_star_order_status(order_id, "delivering", "delivery_failed")
+        logging.exception("Stars delivery failed for order %s", order_id)
+        return False
+    db.change_star_order_status(order_id, "delivering", "delivered")
+    return True
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(query: types.PreCheckoutQuery):
+    order_id = star_order_id(query.invoice_payload)
+    if (
+        STARS_MODE != "telegram_test" or not order_id or query.currency != "XTR"
+        or not db.authorize_star_checkout(order_id, query.from_user.id, query.total_amount, query.id)
+    ):
+        return await query.answer(ok=False, error_message="Счёт недоступен. Создайте новый из каталога.")
+    await query.answer(ok=True)
+
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: types.Message):
+    payment = message.successful_payment
+    order_id = star_order_id(payment.invoice_payload)
+    if STARS_MODE != "telegram_test" or not order_id or payment.currency != "XTR":
+        logging.warning("Unexpected successful payment update")
+        return
+    if not db.record_star_payment(
+        order_id, message.from_user.id, payment.total_amount,
+        payment.telegram_payment_charge_id, "telegram_test"
+    ):
+        order = db.get_star_order(order_id)
+        if not order or order["charge_id"] != payment.telegram_payment_charge_id:
+            logging.warning("Could not match Stars payment to order %s", order_id)
+            return await message.answer(f"Не удалось сверить платёж {order_id}. Откройте /paysupport.")
+        if order["user_id"] != message.from_user.id or order["amount"] != payment.total_amount:
+            return
+    if not await complete_star_delivery(order_id):
+        order = db.get_star_order(order_id)
+        if order["status"] == "delivery_failed":
+            await message.answer(f"Оплата сохранена. Для помощи откройте /paysupport. Заказ: {order_id}")
+
+
+@dp.message(Command("paysupport"))
+async def payment_support(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Отправьте сюда номер заказа и описание проблемы. Сообщение получит администратор. Не присылайте платёжные данные.")
+
+
+@dp.message(Command("retry_stars"))
+async def retry_stars_delivery(message: types.Message, command: CommandObject):
+    if message.from_user.id != ADMIN_ID:
+        return
+    order_id = star_order_id("star:" + (command.args or "").strip())
+    order = db.get_star_order(order_id) if order_id else None
+    delivered = order and order["status"] in ("paid", "delivery_failed") and await complete_star_delivery(
+        order_id, order["status"]
+    )
+    await message.answer("Файл отправлен." if delivered else "Выдача недоступна. Проверьте номер и статус заказа.")
+
+
+@dp.message(Command("price"))
+@dp.message(F.text == TEXTS['ru']['menu_price'])
+async def show_price_list(message: types.Message):
+    data = PRICE_LIST if PRICE_LIST is not None else load_price_list()
+    for section in data["sections"]:
+        await message.answer(format_price_section(section))
+    if data.get("notes"):
+        await message.answer("\n".join(data["notes"]))
+
+
+# --- GLOBAL STATE RESET ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
@@ -125,10 +231,9 @@ async def cancel_add_product(callback: types.CallbackQuery, state: FSMContext):
 async def start_add_product(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return await callback.answer("Нет доступа.", show_alert=True)
-    templates = db.get_templates()
     await callback.message.edit_text(
         "Выберите шаблон или создайте свой товар:",
-        reply_markup=get_product_creation_keyboard(templates)
+        reply_markup=get_product_creation_keyboard([])
     )
     await callback.answer()
 
@@ -149,7 +254,7 @@ async def choose_product_template(callback: types.CallbackQuery):
         return await callback.answer("Сначала добавьте шаблон.", show_alert=True)
     await callback.message.edit_text(
         "Выберите шаблон:",
-        reply_markup=get_product_creation_keyboard(templates)
+        reply_markup=get_product_creation_keyboard(templates, show_choices=False)
     )
     await callback.answer()
 
@@ -234,9 +339,9 @@ async def process_template_price_stars(message: types.Message, state: FSMContext
 
 @dp.message(AdminStates.waiting_for_name)
 async def process_name(message: types.Message, state: FSMContext):
-    if not message.text:
-        return await message.answer("Ошибка: введите текст!")
-    await state.update_data(name=message.text)
+    if not message.text or not 0 < len(message.text.strip()) <= 64:
+        return await message.answer("Введите название от 1 до 64 символов.")
+    await state.update_data(name=message.text.strip())
     await state.set_state(AdminStates.waiting_for_price)
     await message.answer(TEXTS['ru']['admin_enter_price'])
 
@@ -274,15 +379,24 @@ async def process_preview(message: types.Message, state: FSMContext):
 
 @dp.message(AdminStates.waiting_for_full_photo)
 async def process_full_photo(message: types.Message, state: FSMContext):
-    if not message.photo:
-        return await message.answer(TEXTS['ru']['err_photo'])
+    if message.photo:
+        kind, file_id = "photo", message.photo[-1].file_id
+    else:
+        for kind in ("video", "video_note", "document"):
+            media = getattr(message, kind, None)
+            if media:
+                file_id = media.file_id
+                break
+        else:
+            return await message.answer(TEXTS['ru']['admin_enter_full'])
     user_data = await state.get_data()
     db.add_product(
         user_data['name'],
         user_data['price_rub'],
         user_data['price_stars'],
         user_data['photo_id'],
-        message.photo[-1].file_id
+        file_id,
+        kind
     )
     await message.answer(TEXTS['ru']['admin_success'], reply_markup=get_main_menu())
     await state.clear()
@@ -297,36 +411,85 @@ async def show_catalog(message: types.Message):
         
     for prod in products:
         prod_id, name, price_rub, price_stars, photo_id, full_photo_id = prod
+        prices = format_product_prices(prod)
+        if not prices or not full_photo_id:
+            continue
         buy_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text=f"Купить за {price_rub} ₽ / {price_stars}⭐", callback_data=f"buy_{prod_id}")]
+            [InlineKeyboardButton(text=f"Купить за {prices}", callback_data=f"buy_{prod_id}")]
         ])
-        await message.answer_photo(photo=photo_id, caption=f"{name} — {price_rub} ₽ / {price_stars}⭐", reply_markup=buy_kb)
+        await message.answer_photo(photo=photo_id, caption=f"{name} — {prices}", reply_markup=buy_kb)
+
+
+def format_product_prices(product):
+    _, _, price_rub, price_stars, _, _ = product
+    prices = []
+    if price_rub and price_rub > 0:
+        prices.append(f"{price_rub} ₽")
+    if price_stars and price_stars > 0:
+        prices.append(f"{price_stars} ⭐")
+    return " / ".join(prices)
 
 @dp.callback_query(F.data.startswith("buy_"))
 async def process_buy_choice(callback: types.CallbackQuery):
-    product_id = int(callback.data.split("_")[1])
-    payment_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⭐ Оплатить Звездами", callback_data=f"pay_stars_{product_id}")],
-        [InlineKeyboardButton(text="💳 Оплатить на карту", callback_data=f"pay_card_{product_id}")]
-    ])
+    try:
+        product_id = int(callback.data.removeprefix("buy_"))
+    except ValueError:
+        return await callback.answer("Некорректный товар.", show_alert=True)
+    product = db.get_product(product_id)
+    if not product or not product[5]:
+        return await callback.answer("Товар недоступен.", show_alert=True)
+    _, _, price_rub, price_stars, _, _ = product
+    buttons = []
+    if price_stars and price_stars > 0:
+        buttons.append([InlineKeyboardButton(text="⭐ Оплатить Stars", callback_data=f"pay_stars_{product_id}")])
+    if price_rub and price_rub > 0:
+        buttons.append([InlineKeyboardButton(text="💳 Демо с чеком", callback_data=f"pay_card_{product_id}")])
+    if not buttons:
+        return await callback.answer("Цена не задана.", show_alert=True)
+    payment_kb = InlineKeyboardMarkup(inline_keyboard=buttons)
     await callback.message.answer("Выберите удобный способ оплаты:", reply_markup=payment_kb)
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("pay_stars_"))
 async def process_pay_stars(callback: types.CallbackQuery):
-    product_id = int(callback.data.split("_")[2])
+    try:
+        product_id = int(callback.data.removeprefix("pay_stars_"))
+    except ValueError:
+        return await callback.answer("Некорректный товар.", show_alert=True)
     product = db.get_product(product_id)
-    if not product: return await callback.answer("Товар не найден.", show_alert=True)
-        
-    prod_id, name, price_rub, price_stars, photo_id, full_photo_id = product
-    if price_stars is None:
-        return await callback.answer("Для товара не задана цена в Stars.", show_alert=True)
-    await bot.send_invoice(
-        chat_id=callback.from_user.id, title=name, description=f"Доступ: {name}",
-        payload=f"product_{prod_id}", provider_token="", currency="XTR",    
-        prices=[types.LabeledPrice(label=name, amount=price_stars)], start_parameter="shop"
-    )
+    if not product:
+        return await callback.answer("Товар не найден.", show_alert=True)
+    _, name, _, price_stars, _, file_id = product
+    if not isinstance(price_stars, int) or price_stars <= 0 or not file_id:
+        return await callback.answer("Для товара не заданы цена или файл.", show_alert=True)
+    order_id = db.create_star_order(callback.from_user.id, product, STARS_MODE)
     await callback.answer()
+    if STARS_MODE == "demo":
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Имитировать успешную оплату", callback_data=f"star_demo:{order_id}")
+        ]])
+        return await callback.message.answer(
+            f"Демо-счёт: {name} — {price_stars} ⭐. Stars списаны не будут.", reply_markup=keyboard
+        )
+    await bot.send_invoice(
+        chat_id=callback.from_user.id, title=name[:32], description=f"Тестовая покупка: {name}"[:255],
+        payload=f"star:{order_id}", provider_token="", currency="XTR",
+        prices=[types.LabeledPrice(label=name[:32], amount=price_stars)], start_parameter="shop"
+    )
+
+
+@dp.callback_query(F.data.startswith("star_demo:"))
+async def simulate_star_payment(callback: types.CallbackQuery):
+    order_id = star_order_id("star:" + callback.data.removeprefix("star_demo:"))
+    order = db.get_star_order(order_id) if order_id else None
+    if STARS_MODE != "demo" or not order or order["user_id"] != callback.from_user.id:
+        return await callback.answer("Счёт недоступен.", show_alert=True)
+    db.record_star_payment(order_id, order["user_id"], order["amount"], f"demo:{order_id}", "demo")
+    await callback.answer()
+    if not await complete_star_delivery(order_id):
+        order = db.get_star_order(order_id)
+        if order["status"] == "delivery_failed":
+            await callback.message.answer(f"Демо-оплата сохранена. /paysupport. Заказ: {order_id}")
 
 @dp.callback_query(F.data.startswith("pay_card_"))
 async def process_pay_card(callback: types.CallbackQuery):
@@ -351,8 +514,7 @@ async def process_pay_card(callback: types.CallbackQuery):
     await callback.message.answer(
         f"Заявка №{order_id}\n{order['product_name']}\n"
         f"Сумма: {order['price_rub']} ₽\n"
-        f"Реквизиты: {CARD_PAYMENT_DETAILS}\n"
-        "После перевода приложите фото или PDF чека. Выдача — после проверки администратором.",
+        "Это демонстрация. Деньги переводить не нужно. Приложите учебный чек без личных данных.",
         reply_markup=keyboard
     )
 
@@ -380,7 +542,7 @@ def get_card_review_keyboard(order):
     order_id = order["id"]
     if order["status"] == "submitted":
         buttons = [
-            [InlineKeyboardButton(text="Поступление проверено — выдать", callback_data=f"card_approve:{order_id}")],
+            [InlineKeyboardButton(text="Одобрить учебный чек и выдать", callback_data=f"card_approve:{order_id}")],
             [InlineKeyboardButton(text="Отклонить", callback_data=f"card_reject:{order_id}")]
         ]
     elif order["status"] == "delivery_failed":
@@ -395,7 +557,7 @@ async def send_card_order_to_admin(order):
         f"Заявка №{order['id']}\nТовар: {order['product_name'][:150]}\n"
         f"Сумма: {order['price_rub']} ₽\nПокупатель ID: {order['user_id']}\n"
         f"Статус: {order['status']}\n"
-        "Чек сам по себе не подтверждает платёж. Сверьте поступление перед выдачей."
+        "Демо-заявка. Проверьте учебный чек."
     )
     keyboard = get_card_review_keyboard(order)
     if order["receipt_type"] == "photo":
@@ -407,7 +569,7 @@ async def send_card_order_to_admin(order):
 @dp.message(Command("cancel"))
 async def cancel_current_input(message: types.Message, state: FSMContext):
     await state.clear()
-    await message.answer("Ввод отменён. Заявка сохранена: к ней можно вернуться по кнопке отправки чека.")
+    await message.answer("Ввод отменён. Для продолжения откройте меню /start.")
 
 
 @dp.message(CardPaymentStates.waiting_for_receipt)
@@ -431,7 +593,7 @@ async def receive_card_receipt(message: types.Message, state: FSMContext):
     except Exception:
         logging.exception("Could not notify administrator about card order %s", order_id)
         return await message.answer(f"Чек заявки №{order_id} сохранён. Уведомление задерживается; заявка доступна администратору.")
-    await message.answer(f"Чек заявки №{order_id} отправлен на проверку. Товар выдаётся после подтверждения поступления.")
+    await message.answer(f"Учебный чек заявки №{order_id} отправлен на проверку.")
 
 
 @dp.callback_query(F.data == "admin_card_orders")
@@ -471,10 +633,9 @@ async def review_card_order(callback: types.CallbackQuery):
         await callback.message.answer(f"Заявка №{order_id} отклонена.")
         return
     try:
-        await bot.send_photo(
-            order["user_id"], photo=order["full_photo_id"],
-            caption=f"Оплата заявки №{order_id} подтверждена. Спасибо за покупку!",
-            protect_content=True
+        await send_delivery(
+            bot, order["user_id"], order["delivery_kind"], order["full_photo_id"],
+            f"Демо-заявка №{order_id} подтверждена."
         )
     except Exception:
         db.change_card_order_status(order_id, "delivering", "delivery_failed")
@@ -525,7 +686,7 @@ async def cmd_offline(message: types.Message):
     await message.answer(TEXTS['ru']['admin_status_off'])
 
 # --- ОБРАБОТКА ТЕКСТА В ЧАТЕ ---
-@dp.message(F.chat.type == "private", ~F.text.startswith("/"))
+@dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def handle_messages(message: types.Message, state: FSMContext):
     current_state = await state.get_state()
     # Если пользователь в процессе добавления товара, этот обработчик НЕ РАБОТАЕТ
@@ -536,7 +697,7 @@ async def handle_messages(message: types.Message, state: FSMContext):
             client_id = db.get_client_by_admin_msg(message.reply_to_message.message_id)
             if client_id:
                 try:
-                    await bot.send_message(client_id, f"👑 **Автор:**\n{message.text}", parse_mode="Markdown")
+                    await bot.send_message(client_id, f"Автор:\n{message.text}")
                     await message.answer("✅ Ответ отправлен клиенту.")
                 except Exception:
                     await message.answer("❌ Ошибка: клиент заблокировал бота.")
@@ -549,8 +710,7 @@ async def handle_messages(message: types.Message, state: FSMContext):
         try:
             admin_msg = await bot.send_message(
                 chat_id=ADMIN_ID, 
-                text=f"💬 **Сообщение от** @{message.from_user.username}:\n\n{message.text}",
-                parse_mode="Markdown",
+                text=f"💬 Сообщение от пользователя {message.from_user.id}:\n\n{message.text}",
                 reply_markup=types.ForceReply(selective=True)
             )
             db.save_chat_link(admin_msg.message_id, message.from_user.id)
@@ -560,28 +720,15 @@ async def handle_messages(message: types.Message, state: FSMContext):
         if db.get_status() == 'offline':
             await message.answer(TEXTS['ru']['vip_auto_reply'])
 
-# --- ОПЛАТА ЗВЕЗДАМИ (УСПЕХ) ---
-@dp.pre_checkout_query()
-async def process_pre_checkout(query: types.PreCheckoutQuery):
-    await query.answer(ok=True)
-
-@dp.message(F.successful_payment)
-async def process_successful_payment(message: types.Message):
-    product_id = int(message.successful_payment.invoice_payload.split("_")[1])
-    products = db.get_products()
-    product = next((p for p in products if p[0] == product_id), None)
-    if product:
-        prod_id, name, price_rub, price_stars, photo_id, full_photo_id = product
-        await message.answer(f"✅ Оплата звездами прошла успешно! Твой эксклюзив: {name}")
-        try: await message.answer_photo(photo=full_photo_id, caption="Спасибо за покупку!", protect_content=True)
-        except: await message.answer_photo(photo=photo_id, protect_content=True)
-        await bot.send_message(ADMIN_ID, text=f"💰 Новая продажа (Stars)!\nТовар: {name}\nПокупатель: @{message.from_user.username}")
-
 @dp.message(F.text == TEXTS['ru']['menu_lang'])
 async def change_language(message: types.Message):
     await message.answer("Язык изменен на русский.", reply_markup=get_main_menu())
 
 async def main():
+    global PRICE_LIST
+    db.DB_PATH = os.getenv("DB_PATH") or db.DB_PATH
+    PRICE_LIST = load_price_list(os.getenv("PRICE_LIST_PATH") or None)
+    db.init_db()
     print("Bot is starting...")
     await dp.start_polling(bot)
 

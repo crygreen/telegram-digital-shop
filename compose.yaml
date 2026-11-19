@@ -1,0 +1,18 @@
+services:
+  shopbot:
+    build: .
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    environment:
+      DB_PATH: /data/shop_bot.db
+    volumes:
+      - shop-data:/data
+      - ./private:/app/private:ro
+    logging:
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  shop-data:
