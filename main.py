@@ -443,7 +443,7 @@ async def process_buy_choice(callback: types.CallbackQuery):
     if price_stars and price_stars > 0:
         buttons.append([InlineKeyboardButton(text="⭐ Оплатить Stars", callback_data=f"pay_stars_{product_id}")])
     if price_rub and price_rub > 0:
-        buttons.append([InlineKeyboardButton(text="💳 Демо с чеком", callback_data=f"pay_card_{product_id}")])
+        buttons.append([InlineKeyboardButton(text="💳 Оплата картой (демо)", callback_data=f"pay_card_{product_id}")])
     if not buttons:
         return await callback.answer("Цена не задана.", show_alert=True)
     payment_kb = InlineKeyboardMarkup(inline_keyboard=buttons)
